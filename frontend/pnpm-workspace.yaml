@@ -1,0 +1,4 @@
+onlyBuiltDependencies:
+  - "@codex-proxy/ui"
+  - "@tailwindcss/oxide"
+  - esbuild
