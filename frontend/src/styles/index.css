@@ -7,11 +7,16 @@ body,
 #app {
   height: auto;
   min-width: 0;
+  max-width: 100%;
 }
 
 body {
   margin: 0;
+  overflow-x: hidden;
   background: transparent;
+  color: var(--z-color-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
 }
 
 #app {

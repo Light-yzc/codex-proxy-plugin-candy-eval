@@ -150,7 +150,7 @@ pub async fn ensure_runner_client_key(
     host.ensure_group(GroupEnsureRequest {
         resource_key: PLUGIN_GROUP_RESOURCE_KEY.to_owned(),
         name: "candy-eval-internal".to_owned(),
-        color: "#0ea5e9".to_owned(),
+        color: "#0EA5E9FF".to_owned(),
         description: Some("Codex 降智检测插件内置执行分组".to_owned()),
     })
     .await?;

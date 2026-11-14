@@ -3,7 +3,7 @@
   "name": "candy-eval",
   "displayName": "Codex 降智检测",
   "publisher": "light-yzc",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "对 Codex 账号执行糖果题、lm-detector 模型指纹归因与画鹈鹕检测，支持批量队列与每日定时检测，完全复用宿主 Codex 指纹与路由链路",
   "license": "Apache-2.0",
   "author": "Light-yzc",
