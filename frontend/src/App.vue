@@ -555,14 +555,31 @@ function clearSelection() {
   form.value.selectedAccountIds = []
 }
 
+function normalizeScheduleTime(raw: string): string {
+  const trimmed = raw.trim()
+  const match = trimmed.match(/^(\d{2}:\d{2})/)
+  return match ? match[1] : (trimmed || '08:00')
+}
+
 async function handleSaveSettings() {
   saving.value = true
   errorMessage.value = ''
   try {
     const model = effectiveModel()
+    const scheduleTime = normalizeScheduleTime(form.value.scheduleTime)
+    const timezone = form.value.timezone.trim() || 'Asia/Shanghai'
     const res = await saveSettings({
-      ...form.value,
+      mode: form.value.mode,
       model,
+      effort: form.value.effort,
+      runs: form.value.runs,
+      fingerprintConcurrency: form.value.fingerprintConcurrency,
+      pelicanVariant: form.value.pelicanVariant,
+      clientKeyId: form.value.clientKeyId,
+      selectedAccountIds: form.value.selectedAccountIds,
+      scheduleEnabled: form.value.scheduleEnabled,
+      scheduleTime,
+      timezone,
     })
     form.value = { ...res.settings }
     if (!models.value.includes(res.settings.model)) {
@@ -579,6 +596,7 @@ async function handleSaveSettings() {
         ? `每日定时检测已开启（${res.settings.scheduleTime} · ${res.settings.timezone}）`
         : '已保存检测参数与勾选账号',
     })
+    await refreshAll(false)
   }
   catch (err) {
     showError('保存配置失败', err)
@@ -836,7 +854,7 @@ onUnmounted(() => {
           <ZButton
             size="small"
             :loading="loading"
-            @click="refreshAll(false)"
+            @click="errorMessage = ''; refreshAll(false)"
           >
             <template #icon>
               <RefreshCw class="size-3.5" />
@@ -1032,7 +1050,7 @@ onUnmounted(() => {
 
       <!-- 每日定时检测卡片 -->
       <ZCard>
-        <div class="flex min-w-0 flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+        <div class="flex min-w-0 flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
           <div class="flex min-w-0 items-start gap-3">
             <CalendarClock class="mt-0.5 size-5 shrink-0 text-z-primary" />
             <div class="min-w-0">
@@ -1051,7 +1069,7 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div class="flex shrink-0 flex-wrap items-center gap-3">
+          <div class="flex min-w-0 flex-wrap items-center gap-3">
             <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-z-text-secondary">
               <ZSwitch v-model="form.scheduleEnabled" aria-label="启用每日定时检测" />
               <span>每日开启</span>
@@ -1144,7 +1162,7 @@ onUnmounted(() => {
           size="small"
         />
         <div v-else class="w-full min-w-0 overflow-x-auto">
-          <table class="w-full min-w-[680px] border-collapse text-left text-z">
+          <table class="w-full min-w-[640px] border-collapse text-left text-z">
             <thead>
               <tr class="border-b border-z-split text-xs font-emphasis text-z-text-tertiary">
                 <th class="w-10 px-3 py-2.5">

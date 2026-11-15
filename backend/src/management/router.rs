@@ -7,13 +7,15 @@ use gateway_plugin_sdk::client::{TypedCall, TypedReply};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::coordinator::{EvalCoordinator, LiveEvalProgress};
+use crate::coordinator::{
+    EvalCoordinator, LiveEvalProgress, current_local_hhmm, select_target_accounts,
+};
 use crate::eval_runner::{CANDY_MAX_RUNS, PELICAN_VARIANTS};
 use crate::host_calls;
 use crate::lm_detector::detector_revision;
 use crate::state_store::{
     CandyEvalSettings, EvalMode, PelicanVariantKind, QueueState, load_queue, load_record_detail,
-    load_records_index, load_settings, save_settings,
+    load_records_index, load_settings, save_queue, save_settings,
 };
 
 use super::response::{ApiError, ApiResult, json_reply};
@@ -157,14 +159,33 @@ struct SettingsPatchRequest {
     schedule_enabled: Option<bool>,
     schedule_time: Option<String>,
     timezone: Option<String>,
+    /// 兼容旧前端或调用方整对象回传 `updatedAtMs` 时不被拒绝
+    #[serde(default, rename = "updatedAtMs")]
+    _updated_at_ms: Option<i64>,
 }
 
 async fn update_settings(call: TypedCall<ManagementRequest>) -> ApiResult {
     let req: SettingsPatchRequest = decode_json(&call)?;
     let (mut settings, version) = load_settings(&call.host).await?;
+    let prev_enabled = settings.schedule_enabled;
+    let prev_time = settings.schedule_time.clone();
+    let prev_tz = settings.timezone.clone();
     apply_settings_patch(&mut settings, req)?;
     settings.updated_at_ms = Utc::now().timestamp_millis();
     save_settings(&call.host, version, &settings).await?;
+
+    // 当开启定时或改到今日当前/未来新时间点时，重置上次计划日期以便今日新时间正常触发
+    if settings.schedule_enabled
+        && (!prev_enabled || settings.schedule_time != prev_time || settings.timezone != prev_tz)
+        && current_local_hhmm(&settings.timezone) <= settings.schedule_time
+    {
+        let (mut queue, queue_version) = load_queue(&call.host).await?;
+        if !queue.last_scheduled_date.is_empty() {
+            queue.last_scheduled_date.clear();
+            queue.updated_at_ms = settings.updated_at_ms;
+            save_queue(&call.host, queue_version, &queue).await?;
+        }
+    }
     json_reply(&json!({ "settings": settings }))
 }
 
@@ -198,23 +219,15 @@ async fn start_run(coordinator: &EvalCoordinator, call: TypedCall<ManagementRequ
             schedule_enabled: None,
             schedule_time: None,
             timezone: None,
+            _updated_at_ms: None,
         },
     )?;
 
     let all_accounts = host_calls::list_all_openai_accounts(&call.host).await?;
-    let valid_ids: HashSet<&str> = all_accounts.iter().map(|a| a.account_id.as_str()).collect();
-
     let requested_ids = req
         .account_ids
         .unwrap_or_else(|| settings.selected_account_ids.clone());
-    let mut target_ids = Vec::new();
-    let mut seen = HashSet::new();
-    for id in requested_ids {
-        let trimmed = id.trim();
-        if !trimmed.is_empty() && valid_ids.contains(trimmed) && seen.insert(trimmed.to_owned()) {
-            target_ids.push(trimmed.to_owned());
-        }
-    }
+    let target_ids = select_target_accounts(&all_accounts, &requested_ids, false);
     if target_ids.is_empty() {
         return Err(ApiError::invalid("请至少选择一个有效的 OpenAI 账号"));
     }
@@ -300,10 +313,11 @@ fn apply_settings_patch(
         if ids.len() > 200 {
             return Err(ApiError::invalid("最多选择 200 个账号"));
         }
+        let mut seen = HashSet::new();
         settings.selected_account_ids = ids
             .into_iter()
             .map(|id| id.trim().to_owned())
-            .filter(|id| !id.is_empty() && id.len() <= 128)
+            .filter(|id| !id.is_empty() && id.len() <= 128 && seen.insert(id.clone()))
             .collect();
     }
     if let Some(enabled) = req.schedule_enabled {

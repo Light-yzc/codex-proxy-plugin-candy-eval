@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -128,41 +128,53 @@ impl EvalCoordinator {
         let (mut queue, mut queue_version) = load_queue(host).await?;
 
         if settings.schedule_enabled
-            && !settings.selected_account_ids.is_empty()
             && queue.pending_account_ids.is_empty()
             && queue.status == QueueStatus::Idle
             && let Some(today) = should_trigger_today(&settings, &queue.last_scheduled_date)
         {
-            let now_ms = Utc::now().timestamp_millis();
-            queue.active_job_id = Some(Uuid::now_v7().to_string());
-            queue.status = QueueStatus::Running;
-            queue.stop_requested = false;
-            queue.trigger_kind = TriggerKind::Scheduled;
-            queue.mode = settings.mode;
-            queue.model = settings.model.clone();
-            queue.effort = settings.effort.clone();
-            queue.runs = settings.runs.clamp(1, CANDY_MAX_RUNS);
-            queue.fingerprint_concurrency = settings.fingerprint_concurrency.clamp(1, 3);
-            queue.pelican_variant = settings.pelican_variant;
-            queue.client_key_id = settings.client_key_id.clone();
-            queue.total = settings.selected_account_ids.len() as u32;
-            queue.completed = 0;
-            queue.pending_account_ids = settings.selected_account_ids.clone();
-            queue.started_at_ms = Some(now_ms);
-            queue.updated_at_ms = now_ms;
-            queue.last_scheduled_date = today.clone();
-            queue_version = Some(save_queue(host, queue_version, &queue).await?);
-            host_calls::log_event(
-                host,
-                LogLevel::Info,
-                "candy_eval.scheduled_triggered",
-                BTreeMap::from([
-                    ("date".to_owned(), json!(today)),
-                    ("accounts".to_owned(), json!(queue.total)),
-                    ("mode".to_owned(), json!(queue.mode.as_str())),
-                ]),
-            )
-            .await;
+            let all_accounts = host_calls::list_all_openai_accounts(host).await?;
+            let target_ids =
+                select_target_accounts(&all_accounts, &settings.selected_account_ids, true);
+            if target_ids.is_empty() {
+                host_calls::log_event(
+                    host,
+                    LogLevel::Info,
+                    "candy_eval.scheduled_skipped_no_accounts",
+                    BTreeMap::from([("date".to_owned(), json!(today))]),
+                )
+                .await;
+            } else {
+                let now_ms = Utc::now().timestamp_millis();
+                queue.active_job_id = Some(Uuid::now_v7().to_string());
+                queue.status = QueueStatus::Running;
+                queue.stop_requested = false;
+                queue.trigger_kind = TriggerKind::Scheduled;
+                queue.mode = settings.mode;
+                queue.model = settings.model.clone();
+                queue.effort = settings.effort.clone();
+                queue.runs = settings.runs.clamp(1, CANDY_MAX_RUNS);
+                queue.fingerprint_concurrency = settings.fingerprint_concurrency.clamp(1, 3);
+                queue.pelican_variant = settings.pelican_variant;
+                queue.client_key_id = settings.client_key_id.clone();
+                queue.total = target_ids.len() as u32;
+                queue.completed = 0;
+                queue.pending_account_ids = target_ids;
+                queue.started_at_ms = Some(now_ms);
+                queue.updated_at_ms = now_ms;
+                queue.last_scheduled_date = today.clone();
+                queue_version = Some(save_queue(host, queue_version, &queue).await?);
+                host_calls::log_event(
+                    host,
+                    LogLevel::Info,
+                    "candy_eval.scheduled_triggered",
+                    BTreeMap::from([
+                        ("date".to_owned(), json!(today)),
+                        ("accounts".to_owned(), json!(queue.total)),
+                        ("mode".to_owned(), json!(queue.mode.as_str())),
+                    ]),
+                )
+                .await;
+            }
         }
         let _ = queue_version;
 
@@ -209,16 +221,7 @@ impl EvalCoordinator {
         let account_id = queue.pending_account_ids[0].clone();
         let account_name = account_map
             .get(&account_id)
-            .map(|a| {
-                if let Some(email) = &a.email
-                    && !email.is_empty()
-                    && email != &a.name
-                {
-                    format!("{} ({email})", a.name)
-                } else {
-                    a.name.clone()
-                }
-            })
+            .map(|a| format_account_name(a, &account_id))
             .unwrap_or_else(|| account_id.clone());
 
         let item_total = match queue.mode {
@@ -353,6 +356,64 @@ impl EvalCoordinator {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *live = LiveEvalProgress::default();
     }
+}
+
+/// 规范化账号展示名称，避免账号 `name` 为空时产生 `" (email)"` 前导空格。
+#[must_use]
+pub fn format_account_name(account: &AccountFacts, fallback_id: &str) -> String {
+    let name = account.name.trim();
+    let email = account.email.as_deref().map(str::trim).unwrap_or("");
+    match (name.is_empty(), email.is_empty()) {
+        (false, false) if email != name => format!("{name} ({email})"),
+        (false, _) => name.to_owned(),
+        (true, false) => email.to_owned(),
+        (true, true) => {
+            let trimmed = fallback_id.trim();
+            if trimmed.is_empty() {
+                account.account_id.clone()
+            } else {
+                trimmed.to_owned()
+            }
+        }
+    }
+}
+
+/// 从候选账号列表筛选目标账号 ID：若 `selected_ids` 非空则保留其中有效的 ID（去重保序），
+/// 若 `selected_ids` 为空且 `fallback_to_enabled == true` 则回退至全部已启用账号。
+#[must_use]
+pub fn select_target_accounts(
+    accounts: &[AccountFacts],
+    selected_ids: &[String],
+    fallback_to_enabled: bool,
+) -> Vec<String> {
+    let valid_ids: HashSet<&str> = accounts.iter().map(|a| a.account_id.as_str()).collect();
+    if selected_ids.is_empty() {
+        return if fallback_to_enabled {
+            accounts
+                .iter()
+                .filter(|a| a.enabled)
+                .map(|a| a.account_id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+    }
+
+    let mut target_ids = Vec::new();
+    let mut seen = HashSet::new();
+    for id in selected_ids {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() && valid_ids.contains(trimmed) && seen.insert(trimmed.to_owned()) {
+            target_ids.push(trimmed.to_owned());
+        }
+    }
+    target_ids
+}
+
+#[must_use]
+pub fn current_local_hhmm(timezone: &str) -> String {
+    let tz: chrono_tz::Tz = timezone.parse().unwrap_or(chrono_tz::Asia::Shanghai);
+    Utc::now().with_timezone(&tz).format("%H:%M").to_string()
 }
 
 #[must_use]

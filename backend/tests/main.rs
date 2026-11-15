@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
 use codex_proxy_plugin_candy_eval::codex_turn::build_codex_turn_body;
+use codex_proxy_plugin_candy_eval::coordinator::{
+    format_account_name, select_target_accounts, should_trigger_today,
+};
 use codex_proxy_plugin_candy_eval::eval_runner::{
     PELICAN_VARIANTS, extract_fenced_code, has_standalone_21,
 };
@@ -11,6 +14,7 @@ use codex_proxy_plugin_candy_eval::state_store::{
     CandyEvalSettings, QueueState, RecordDetail, RecordsIndex,
 };
 use codex_proxy_plugin_candy_eval::{manifest, plugin};
+use gateway_plugin_sdk::call::data::AccountFacts;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -103,10 +107,7 @@ fn lm_detector_golden_vectors_match() {
         canonical_fingerprint_model_id("openai/GPT-5.3-Codex"),
         "gpt-5.3-codex"
     );
-    assert_eq!(
-        canonical_fingerprint_model_id("gpt-6.1-sol"),
-        "gpt-6-astra"
-    );
+    assert_eq!(canonical_fingerprint_model_id("gpt-6.1-sol"), "gpt-6-astra");
 }
 
 #[test]
@@ -129,4 +130,70 @@ fn helper_parsers_match_expected_behavior() {
         "<!doctype html><b>ok</b>"
     );
     assert_eq!(PELICAN_VARIANTS.len(), 2);
+}
+
+fn sample_account(
+    account_id: &str,
+    name: &str,
+    email: Option<&str>,
+    enabled: bool,
+) -> AccountFacts {
+    AccountFacts {
+        account_id: account_id.to_owned(),
+        provider_id: "openai".to_owned(),
+        name: name.to_owned(),
+        email: email.map(ToOwned::to_owned),
+        group_ids: Vec::new(),
+        enabled,
+        updated_at_ms: 0,
+    }
+}
+
+#[test]
+fn scheduled_account_selection_and_name_formatting() {
+    let accounts = vec![
+        sample_account("acct_1", "", Some("a@example.com"), false),
+        sample_account("acct_2", "Main", Some("b@example.com"), true),
+        sample_account("acct_3", "dup@example.com", Some("dup@example.com"), true),
+    ];
+
+    assert_eq!(format_account_name(&accounts[0], "acct_1"), "a@example.com");
+    assert_eq!(
+        format_account_name(&accounts[1], "acct_2"),
+        "Main (b@example.com)"
+    );
+    assert_eq!(
+        format_account_name(&accounts[2], "acct_3"),
+        "dup@example.com"
+    );
+
+    // 未勾选账号时，定时模式回退至全部已启用账号
+    assert_eq!(
+        select_target_accounts(&accounts, &[], true),
+        vec!["acct_2".to_owned(), "acct_3".to_owned()]
+    );
+    // 手动未勾选时返回空
+    assert!(select_target_accounts(&accounts, &[], false).is_empty());
+    // 显式勾选时去重保序并过滤未知账号
+    assert_eq!(
+        select_target_accounts(
+            &accounts,
+            &[
+                " acct_1 ".to_owned(),
+                "missing".to_owned(),
+                "acct_1".to_owned(),
+                "acct_3".to_owned()
+            ],
+            true
+        ),
+        vec!["acct_1".to_owned(), "acct_3".to_owned()]
+    );
+
+    let settings = CandyEvalSettings {
+        schedule_time: "00:00".to_owned(),
+        timezone: "Asia/Shanghai".to_owned(),
+        ..CandyEvalSettings::default()
+    };
+    let triggered = should_trigger_today(&settings, "").expect("00:00 should trigger today");
+    assert!(should_trigger_today(&settings, &triggered).is_none());
 }

@@ -115,11 +115,13 @@ export function fetchRecordDetail(id: string) {
   return request<RecordDetail>({ url: 'api/record-detail', method: 'POST', data: { id } })
 }
 
-export function saveSettings(patch: Partial<CandyEvalSettings>) {
+export type CandyEvalSettingsPatch = Partial<Omit<CandyEvalSettings, 'updatedAtMs'>>
+
+export function saveSettings(patch: CandyEvalSettingsPatch) {
   return request<{ settings: CandyEvalSettings }>({ url: 'api/settings', method: 'POST', data: patch })
 }
 
-export function startRun(payload: Partial<CandyEvalSettings> & { accountIds: string[] }) {
+export function startRun(payload: CandyEvalSettingsPatch & { accountIds: string[] }) {
   return request<{ started: boolean, queue: QueueState }>({ url: 'api/run', method: 'POST', data: payload })
 }
 
