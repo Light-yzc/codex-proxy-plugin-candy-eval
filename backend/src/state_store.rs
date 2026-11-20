@@ -70,6 +70,8 @@ pub struct CandyEvalSettings {
     pub schedule_enabled: bool,
     pub schedule_time: String,
     pub timezone: String,
+    #[serde(default)]
+    pub schedule_spread_minutes: u32,
     pub updated_at_ms: i64,
 }
 
@@ -87,6 +89,7 @@ impl Default for CandyEvalSettings {
             schedule_enabled: false,
             schedule_time: "08:00".to_owned(),
             timezone: "Asia/Shanghai".to_owned(),
+            schedule_spread_minutes: 60,
             updated_at_ms: 0,
         }
     }
@@ -112,6 +115,12 @@ pub struct QueueState {
     pub started_at_ms: Option<i64>,
     pub updated_at_ms: i64,
     pub last_scheduled_date: String,
+    #[serde(default)]
+    pub spread_minutes: u32,
+    #[serde(default)]
+    pub next_run_at_ms: Option<i64>,
+    #[serde(default)]
+    pub window_end_at_ms: Option<i64>,
 }
 
 impl Default for QueueState {
@@ -134,6 +143,9 @@ impl Default for QueueState {
             started_at_ms: None,
             updated_at_ms: 0,
             last_scheduled_date: String::new(),
+            spread_minutes: 0,
+            next_run_at_ms: None,
+            window_end_at_ms: None,
         }
     }
 }

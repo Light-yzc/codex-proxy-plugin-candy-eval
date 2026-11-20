@@ -30,6 +30,7 @@ export interface CandyEvalSettings {
   scheduleEnabled: boolean
   scheduleTime: string
   timezone: string
+  scheduleSpreadMinutes?: number
   updatedAtMs: number
 }
 
@@ -51,6 +52,9 @@ export interface QueueState {
   startedAtMs: number | null
   updatedAtMs: number
   lastScheduledDate: string
+  spreadMinutes?: number
+  nextRunAtMs?: number | null
+  windowEndAtMs?: number | null
 }
 
 export interface LiveEvalProgress {
@@ -61,8 +65,20 @@ export interface LiveEvalProgress {
   currentItemTotal: number
 }
 
+export interface DetectorInfo {
+  revision: string
+  builtAt: string
+  modelCount: number
+  source: 'remote' | 'embedded' | string
+  commitSha: string | null
+  updatedAtMs: number | null
+  lastCheckedAtMs: number | null
+  lastError: string | null
+}
+
 export interface StatusResponse {
   detectorRevision: string
+  detectorInfo?: DetectorInfo
   accounts: AccountView[]
   keys: ClientKeyView[]
   models: string[]
@@ -138,5 +154,13 @@ export function deleteRecords(ids?: string[]) {
     url: 'api/records/delete',
     method: 'POST',
     data: ids ? { ids } : {},
+  })
+}
+
+export function refreshDetector() {
+  return request<{ updated: boolean, detectorInfo: DetectorInfo }>({
+    url: 'api/detector/refresh',
+    method: 'POST',
+    data: {},
   })
 }

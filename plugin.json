@@ -3,7 +3,7 @@
   "name": "candy-eval",
   "displayName": "Codex 降智检测",
   "publisher": "light-yzc",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "对 Codex 账号执行糖果题、lm-detector 模型指纹归因与画鹈鹕检测，支持批量队列与每日定时检测，完全复用宿主 Codex 指纹与路由链路",
   "license": "Apache-2.0",
   "author": "Light-yzc",
@@ -52,22 +52,75 @@
           "updatedAtMs"
         ],
         "properties": {
-          "mode": { "type": "string", "enum": ["candy", "fingerprint", "pelican"] },
-          "model": { "type": "string", "minLength": 1, "maxLength": 128 },
-          "effort": { "type": "string", "maxLength": 32 },
-          "runs": { "type": "integer", "minimum": 1, "maximum": 10 },
-          "fingerprintConcurrency": { "type": "integer", "minimum": 1, "maximum": 3 },
-          "pelicanVariant": { "type": "string", "enum": ["original", "all-in-one"] },
-          "clientKeyId": { "type": "string", "maxLength": 128 },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "candy",
+              "fingerprint",
+              "pelican"
+            ]
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "effort": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "runs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10
+          },
+          "fingerprintConcurrency": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3
+          },
+          "pelicanVariant": {
+            "type": "string",
+            "enum": [
+              "original",
+              "all-in-one"
+            ]
+          },
+          "clientKeyId": {
+            "type": "string",
+            "maxLength": 128
+          },
           "selectedAccountIds": {
             "type": "array",
             "maxItems": 200,
-            "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
           },
-          "scheduleEnabled": { "type": "boolean" },
-          "scheduleTime": { "type": "string", "minLength": 5, "maxLength": 5 },
-          "timezone": { "type": "string", "minLength": 1, "maxLength": 64 },
-          "updatedAtMs": { "type": "integer", "minimum": 0 }
+          "scheduleEnabled": {
+            "type": "boolean"
+          },
+          "scheduleTime": {
+            "type": "string",
+            "minLength": 5,
+            "maxLength": 5
+          },
+          "timezone": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "updatedAtMs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "scheduleSpreadMinutes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 360
+          }
         }
       },
       "maximumRecords": 1,
@@ -101,27 +154,119 @@
           "lastScheduledDate"
         ],
         "properties": {
-          "activeJobId": { "type": ["string", "null"], "maxLength": 128 },
-          "status": { "type": "string", "enum": ["idle", "running", "stopping"] },
-          "stopRequested": { "type": "boolean" },
-          "triggerKind": { "type": "string", "enum": ["manual", "scheduled"] },
-          "mode": { "type": "string", "enum": ["candy", "fingerprint", "pelican"] },
-          "model": { "type": "string", "maxLength": 128 },
-          "effort": { "type": "string", "maxLength": 32 },
-          "runs": { "type": "integer", "minimum": 1, "maximum": 10 },
-          "fingerprintConcurrency": { "type": "integer", "minimum": 1, "maximum": 3 },
-          "pelicanVariant": { "type": "string", "enum": ["original", "all-in-one"] },
-          "clientKeyId": { "type": "string", "maxLength": 128 },
+          "activeJobId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 128
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "idle",
+              "running",
+              "stopping"
+            ]
+          },
+          "stopRequested": {
+            "type": "boolean"
+          },
+          "triggerKind": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "scheduled"
+            ]
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "candy",
+              "fingerprint",
+              "pelican"
+            ]
+          },
+          "model": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "effort": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "runs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10
+          },
+          "fingerprintConcurrency": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3
+          },
+          "pelicanVariant": {
+            "type": "string",
+            "enum": [
+              "original",
+              "all-in-one"
+            ]
+          },
+          "clientKeyId": {
+            "type": "string",
+            "maxLength": 128
+          },
           "pendingAccountIds": {
             "type": "array",
             "maxItems": 200,
-            "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
           },
-          "total": { "type": "integer", "minimum": 0 },
-          "completed": { "type": "integer", "minimum": 0 },
-          "startedAtMs": { "type": ["integer", "null"], "minimum": 0 },
-          "updatedAtMs": { "type": "integer", "minimum": 0 },
-          "lastScheduledDate": { "type": "string", "maxLength": 32 }
+          "total": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "completed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "startedAtMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "updatedAtMs": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lastScheduledDate": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "spreadMinutes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 360
+          },
+          "nextRunAtMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "windowEndAtMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          }
         }
       },
       "maximumRecords": 1,
@@ -135,7 +280,9 @@
       "schema": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["records"],
+        "required": [
+          "records"
+        ],
         "properties": {
           "records": {
             "type": "array",
@@ -162,22 +309,78 @@
                 "createdAtMs"
               ],
               "properties": {
-                "id": { "type": "string", "minLength": 1, "maxLength": 128 },
-                "accountId": { "type": "string", "minLength": 1, "maxLength": 128 },
-                "accountName": { "type": "string", "maxLength": 256 },
-                "evalType": { "type": "string", "enum": ["candy", "fingerprint", "pelican"] },
-                "triggerKind": { "type": "string", "enum": ["manual", "scheduled"] },
-                "model": { "type": "string", "maxLength": 128 },
-                "status": { "type": "string", "maxLength": 32 },
-                "effort": { "type": "string", "maxLength": 32 },
-                "variant": { "type": "string", "maxLength": 32 },
-                "summary": { "type": "object" },
-                "durationMs": { "type": "integer", "minimum": 0 },
-                "inputTokens": { "type": "integer", "minimum": 0 },
-                "outputTokens": { "type": "integer", "minimum": 0 },
-                "reasoningTokens": { "type": "integer", "minimum": 0 },
-                "errorMessage": { "type": "string", "maxLength": 1024 },
-                "createdAtMs": { "type": "integer", "minimum": 0 }
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "accountId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "accountName": {
+                  "type": "string",
+                  "maxLength": 256
+                },
+                "evalType": {
+                  "type": "string",
+                  "enum": [
+                    "candy",
+                    "fingerprint",
+                    "pelican"
+                  ]
+                },
+                "triggerKind": {
+                  "type": "string",
+                  "enum": [
+                    "manual",
+                    "scheduled"
+                  ]
+                },
+                "model": {
+                  "type": "string",
+                  "maxLength": 128
+                },
+                "status": {
+                  "type": "string",
+                  "maxLength": 32
+                },
+                "effort": {
+                  "type": "string",
+                  "maxLength": 32
+                },
+                "variant": {
+                  "type": "string",
+                  "maxLength": 32
+                },
+                "summary": {
+                  "type": "object"
+                },
+                "durationMs": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "inputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "outputTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "reasoningTokens": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "errorMessage": {
+                  "type": "string",
+                  "maxLength": 1024
+                },
+                "createdAtMs": {
+                  "type": "integer",
+                  "minimum": 0
+                }
               }
             }
           }
@@ -194,10 +397,19 @@
       "schema": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "detail"],
+        "required": [
+          "id",
+          "detail"
+        ],
         "properties": {
-          "id": { "type": "string", "minLength": 1, "maxLength": 128 },
-          "detail": { "type": "object" }
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "detail": {
+            "type": "object"
+          }
         }
       },
       "maximumRecords": 120,

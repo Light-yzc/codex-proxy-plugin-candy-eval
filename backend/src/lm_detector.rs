@@ -1,15 +1,22 @@
 //! 模型数字指纹归因（移植自 Ikaleio/lm-detector MIT 实现，见 data/candy_eval/lm-detector/LICENSE）
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{Arc, OnceLock, RwLock};
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const DETECTOR_BIN: &[u8] = include_bytes!("../data/lm-detector/shared_detector.bin");
 const MODELS_JSON: &str = include_str!("../data/lm-detector/models.json");
+const ENROLLMENT_SUITE_EMBEDDED: &str = include_str!("../data/lm-detector/enrollment-suite.json");
 const LICENSE_TEXT: &str = include_str!("../data/lm-detector/LICENSE");
+const UPSTREAM_COMMITS_URL: &str = "https://api.github.com/repos/Ikaleio/lm-detector/commits/main";
+const UPSTREAM_RAW_BASE: &str = "https://raw.githubusercontent.com/Ikaleio/lm-detector";
+const AUTO_SYNC_INTERVAL_MS: i64 = 6 * 3600 * 1000;
 
 pub const FINGERPRINT_TARGET: usize = 3;
 pub const FINGERPRINT_MAX_TEXT: usize = 64_000;
@@ -41,6 +48,7 @@ struct FeatureBank {
 #[derive(Debug, Clone)]
 struct Detector {
     revision: String,
+    built_at: String,
     tau: f64,
     models: Vec<DetectorModelMeta>,
     head_params: Vec<Scaling>,
@@ -105,15 +113,318 @@ pub struct FingerprintAttribution {
     pub diagnostics: Vec<FingerprintDiagnostic>,
 }
 
-static SHARED_DETECTOR: OnceLock<Detector> = OnceLock::new();
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectorInfo {
+    pub revision: String,
+    pub built_at: String,
+    pub model_count: usize,
+    pub source: String,
+    pub commit_sha: Option<String>,
+    pub updated_at_ms: Option<i64>,
+    pub last_checked_at_ms: Option<i64>,
+    pub last_error: Option<String>,
+}
 
-fn detector() -> &'static Detector {
-    SHARED_DETECTOR.get_or_init(|| decode_detector(DETECTOR_BIN, MODELS_JSON))
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedMeta {
+    commit_sha: String,
+    built_at: String,
+    updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct DetectorRuntime {
+    detector: Arc<Detector>,
+    enrollment_suite_json: Arc<String>,
+    source: String,
+    commit_sha: Option<String>,
+    updated_at_ms: Option<i64>,
+    last_checked_at_ms: Option<i64>,
+    last_error: Option<String>,
+}
+
+static RUNTIME_STATE: OnceLock<RwLock<DetectorRuntime>> = OnceLock::new();
+static SYNC_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+fn cache_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CANDY_EVAL_CACHE_DIR")
+        && !dir.trim().is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    let runtime_root = PathBuf::from("/app/.runtime/data");
+    if runtime_root.is_dir() {
+        return runtime_root.join("candy-eval-lm-detector");
+    }
+    std::env::temp_dir().join("candy-eval-lm-detector")
+}
+
+fn init_runtime() -> DetectorRuntime {
+    #[cfg(not(test))]
+    {
+        let dir = cache_dir();
+        let bin_path = dir.join("shared_detector.bin");
+        let models_path = dir.join("models.json");
+        let suite_path = dir.join("enrollment-suite.json");
+        let meta_path = dir.join("meta.json");
+        if let (Ok(bin), Ok(models), Ok(suite)) = (
+            std::fs::read(&bin_path),
+            std::fs::read_to_string(&models_path),
+            std::fs::read_to_string(&suite_path),
+        ) && serde_json::from_str::<Value>(&suite).is_ok()
+            && let Ok(det) = try_decode_detector(&bin, &models)
+        {
+            let meta: CachedMeta = std::fs::read_to_string(&meta_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
+            return DetectorRuntime {
+                detector: Arc::new(det),
+                enrollment_suite_json: Arc::new(suite),
+                source: "remote".to_owned(),
+                commit_sha: (!meta.commit_sha.is_empty()).then_some(meta.commit_sha),
+                updated_at_ms: (meta.updated_at_ms > 0).then_some(meta.updated_at_ms),
+                last_checked_at_ms: None,
+                last_error: None,
+            };
+        }
+    }
+    let det = try_decode_detector(DETECTOR_BIN, MODELS_JSON).expect("valid embedded lm-detector");
+    DetectorRuntime {
+        detector: Arc::new(det),
+        enrollment_suite_json: Arc::new(ENROLLMENT_SUITE_EMBEDDED.to_owned()),
+        source: "embedded".to_owned(),
+        commit_sha: None,
+        updated_at_ms: None,
+        last_checked_at_ms: None,
+        last_error: None,
+    }
+}
+
+fn runtime_lock() -> &'static RwLock<DetectorRuntime> {
+    RUNTIME_STATE.get_or_init(|| RwLock::new(init_runtime()))
+}
+
+fn detector() -> Arc<Detector> {
+    let guard = runtime_lock()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(&guard.detector)
 }
 
 #[must_use]
-pub fn detector_revision() -> &'static str {
-    &detector().revision
+pub fn current_enrollment_suite_json() -> Arc<String> {
+    let guard = runtime_lock()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Arc::clone(&guard.enrollment_suite_json)
+}
+
+#[must_use]
+pub fn detector_revision() -> String {
+    detector().revision.clone()
+}
+
+#[must_use]
+pub fn detector_info() -> DetectorInfo {
+    let guard = runtime_lock()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    DetectorInfo {
+        revision: guard.detector.revision.clone(),
+        built_at: guard.detector.built_at.clone(),
+        model_count: guard.detector.models.len(),
+        source: guard.source.clone(),
+        commit_sha: guard.commit_sha.clone(),
+        updated_at_ms: guard.updated_at_ms,
+        last_checked_at_ms: guard.last_checked_at_ms,
+        last_error: guard.last_error.clone(),
+    }
+}
+
+/// 若距上次检查已超过 6 小时（或启动后尚未检查），则自动从 `Ikaleio/lm-detector` 拉取最新指纹库。
+pub async fn maybe_auto_sync() -> Result<DetectorInfo, String> {
+    sync_detector_inner(false).await
+}
+
+/// 立即从 `Ikaleio/lm-detector` 检查并拉取最新指纹库。
+pub async fn force_sync_detector() -> Result<DetectorInfo, String> {
+    sync_detector_inner(true).await
+}
+
+async fn sync_detector_inner(force: bool) -> Result<DetectorInfo, String> {
+    let lock = SYNC_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+    let _guard = lock.lock().await;
+
+    let now_ms = Utc::now().timestamp_millis();
+    let (last_checked, current_sha, current_source) = {
+        let rt = runtime_lock()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            rt.last_checked_at_ms,
+            rt.commit_sha.clone(),
+            rt.source.clone(),
+        )
+    };
+    if !force
+        && let Some(ts) = last_checked
+        && now_ms.saturating_sub(ts) < AUTO_SYNC_INTERVAL_MS
+    {
+        return Ok(detector_info());
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let res = fetch_and_validate_upstream(force, current_sha.as_deref(), &current_source);
+        let _ = tx.send(res);
+    });
+
+    let outcome = rx.await.map_err(|_| "指纹库同步线程异常终止".to_owned())?;
+
+    let checked_ms = Utc::now().timestamp_millis();
+    match outcome {
+        Ok(Some((det, suite_json, sha))) => {
+            let mut rt = runtime_lock()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            rt.detector = Arc::new(det);
+            rt.enrollment_suite_json = Arc::new(suite_json);
+            rt.source = "remote".to_owned();
+            rt.commit_sha = Some(sha);
+            rt.updated_at_ms = Some(checked_ms);
+            rt.last_checked_at_ms = Some(checked_ms);
+            rt.last_error = None;
+            drop(rt);
+            Ok(detector_info())
+        }
+        Ok(None) => {
+            let mut rt = runtime_lock()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            rt.last_checked_at_ms = Some(checked_ms);
+            rt.last_error = None;
+            drop(rt);
+            Ok(detector_info())
+        }
+        Err(err) => {
+            let mut rt = runtime_lock()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            rt.last_checked_at_ms = Some(checked_ms);
+            rt.last_error = Some(err.clone());
+            drop(rt);
+            Err(err)
+        }
+    }
+}
+
+fn curl_get(url: &str, timeout_secs: u32) -> Result<Vec<u8>, String> {
+    let output = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            &timeout_secs.to_string(),
+            "-H",
+            "User-Agent: codex-proxy-plugin-candy-eval",
+            url,
+        ])
+        .output()
+        .map_err(|e| format!("无法调用 curl：{e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("拉取 {url} 失败：{}", stderr.trim()));
+    }
+    Ok(output.stdout)
+}
+
+fn fetch_and_validate_upstream(
+    force: bool,
+    current_sha: Option<&str>,
+    current_source: &str,
+) -> Result<Option<(Detector, String, String)>, String> {
+    let commit_bytes = curl_get(UPSTREAM_COMMITS_URL, 20)?;
+    let commit_val: Value =
+        serde_json::from_slice(&commit_bytes).map_err(|e| format!("解析提交信息失败：{e}"))?;
+    let sha = commit_val["sha"]
+        .as_str()
+        .filter(|s| s.len() >= 7 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or_else(|| "上游提交 SHA 无效".to_owned())?
+        .to_owned();
+
+    if !force && current_source == "remote" && current_sha == Some(sha.as_str()) {
+        return Ok(None);
+    }
+
+    let bin_url = format!("{UPSTREAM_RAW_BASE}/{sha}/data/shared_detector.bin");
+    let suite_url = format!("{UPSTREAM_RAW_BASE}/{sha}/data/enrollment-suite.json");
+    let bank_url = format!("{UPSTREAM_RAW_BASE}/{sha}/data/unified_bank.json");
+
+    let bin_bytes = curl_get(&bin_url, 60)?;
+    let suite_bytes = curl_get(&suite_url, 30)?;
+    let bank_bytes = curl_get(&bank_url, 60)?;
+
+    let suite_json = String::from_utf8(suite_bytes)
+        .map_err(|e| format!("enrollment-suite.json 非 UTF-8：{e}"))?;
+    let suite_val: Value = serde_json::from_str(&suite_json)
+        .map_err(|e| format!("enrollment-suite.json 解析失败：{e}"))?;
+    if suite_val.as_array().is_none_or(Vec::is_empty) {
+        return Err("enrollment-suite.json 为空".to_owned());
+    }
+
+    let bank_val: Value = serde_json::from_slice(&bank_bytes)
+        .map_err(|e| format!("unified_bank.json 解析失败：{e}"))?;
+    let built_at = bank_val["built_at"]
+        .as_str()
+        .ok_or_else(|| "unified_bank.json 缺少 built_at".to_owned())?;
+    let raw_models = bank_val["models"]
+        .as_array()
+        .ok_or_else(|| "unified_bank.json 缺少 models".to_owned())?;
+    let compact_models: Vec<Value> = raw_models
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m["id"],
+                "display_name": m["display_name"],
+                "family": m["family"],
+                "family_name": m["family_name"],
+                "response_count": m["response_count"],
+            })
+        })
+        .collect();
+    let models_json = serde_json::to_string_pretty(&serde_json::json!({
+        "built_at": built_at,
+        "models": compact_models,
+    }))
+    .map_err(|e| format!("序列化 models.json 失败：{e}"))?;
+
+    let det = try_decode_detector(&bin_bytes, &models_json)?;
+
+    let dir = cache_dir();
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let now_ms = Utc::now().timestamp_millis();
+        let meta = CachedMeta {
+            commit_sha: sha.clone(),
+            built_at: det.built_at.clone(),
+            updated_at_ms: now_ms,
+        };
+        let _ = write_atomic(&dir.join("shared_detector.bin"), &bin_bytes);
+        let _ = write_atomic(&dir.join("models.json"), models_json.as_bytes());
+        let _ = write_atomic(&dir.join("enrollment-suite.json"), suite_json.as_bytes());
+        if let Ok(meta_raw) = serde_json::to_vec_pretty(&meta) {
+            let _ = write_atomic(&dir.join("meta.json"), &meta_raw);
+        }
+    }
+
+    Ok(Some((det, suite_json, sha)))
+}
+
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 #[must_use]
@@ -283,12 +594,22 @@ pub fn analyze_fingerprint(
     })
 }
 
-fn decode_detector(file: &[u8], models_json: &str) -> Detector {
+fn try_decode_detector(file: &[u8], models_json: &str) -> Result<Detector, String> {
     let revision = format!("sha256:{}", hex::encode(Sha256::digest(file)));
-    assert!(file.len() >= 4, "lm-detector binary truncated");
+    if file.len() < 4 {
+        return Err("lm-detector binary truncated".to_owned());
+    }
     let header_len = u32::from_le_bytes([file[0], file[1], file[2], file[3]]) as usize;
-    let header_end = 4 + header_len;
+    let header_end = 4usize
+        .checked_add(header_len)
+        .ok_or_else(|| "header length overflow".to_owned())?;
+    if header_end > file.len() {
+        return Err("lm-detector header out of bounds".to_owned());
+    }
     let start = header_end.div_ceil(4) * 4;
+    if start > file.len() {
+        return Err("lm-detector payload out of bounds".to_owned());
+    }
     let count = (file.len() - start) / 4;
     let mut floats = Vec::with_capacity(count);
     for i in 0..count {
@@ -299,15 +620,15 @@ fn decode_detector(file: &[u8], models_json: &str) -> Detector {
         floats.push(f64::from(f32::from_le_bytes([b0, b1, b2, b3])));
     }
 
-    let header: Value =
-        serde_json::from_slice(&file[4..header_end]).expect("valid lm-detector header json");
+    let header: Value = serde_json::from_slice(&file[4..header_end])
+        .map_err(|e| format!("invalid lm-detector header json: {e}"))?;
     #[derive(Deserialize)]
     struct ModelsManifest {
         built_at: String,
         models: Vec<DetectorModelMeta>,
     }
-    let bank: ModelsManifest =
-        serde_json::from_str(models_json).expect("valid lm-detector models.json");
+    let bank: ModelsManifest = serde_json::from_str(models_json)
+        .map_err(|e| format!("invalid lm-detector models.json: {e}"))?;
 
     let schema = header["schema"].as_str().unwrap_or_default();
     let bank_built_at = header["bank_built_at"].as_str().unwrap_or_default();
@@ -317,10 +638,14 @@ fn decode_detector(file: &[u8], models_json: &str) -> Detector {
         .unwrap_or_default();
     let model_ids: Vec<String> = header["model_ids"]
         .as_array()
-        .expect("model_ids array")
+        .ok_or_else(|| "missing model_ids array".to_owned())?
         .iter()
-        .map(|v| v.as_str().expect("model id string").to_owned())
-        .collect();
+        .map(|v| {
+            v.as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| "model id not string".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let response_counts = resolve_vector(&header["response_counts"], &floats);
 
     let calibration = &header["calibration"];
@@ -332,33 +657,39 @@ fn decode_detector(file: &[u8], models_json: &str) -> Detector {
     let cal_ref = cal_binding["reference_sha256"].as_str().unwrap_or_default();
     let cal_ids: Vec<String> = cal_binding["model_ids"]
         .as_array()
-        .expect("calibration model_ids")
+        .ok_or_else(|| "missing calibration model_ids".to_owned())?
         .iter()
-        .map(|v| v.as_str().expect("cal model id").to_owned())
-        .collect();
+        .map(|v| {
+            v.as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| "cal model id not string".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    assert!(
-        schema == "shared-detector-v2"
-            && bank.built_at == bank_built_at
-            && bank.models.len() == model_ids.len()
-            && bank
-                .models
-                .iter()
-                .zip(&model_ids)
-                .all(|(m, id)| m.id == *id)
-            && cal_schema == "shared-confidence-v2"
-            && cal_method == "ranking-temperature"
-            && (0.001..=1000.0).contains(&tau)
-            && cal_base == base_sha256
-            && cal_ref == ref_sha256
-            && cal_ids == model_ids,
-        "lm-detector detector, models and calibration do not match"
-    );
+    if !(schema == "shared-detector-v2"
+        && bank.built_at == bank_built_at
+        && bank.models.len() == model_ids.len()
+        && bank
+            .models
+            .iter()
+            .zip(&model_ids)
+            .all(|(m, id)| m.id == *id)
+        && cal_schema == "shared-confidence-v2"
+        && cal_method == "ranking-temperature"
+        && (0.001..=1000.0).contains(&tau)
+        && cal_base == base_sha256
+        && cal_ref == ref_sha256
+        && cal_ids == model_ids)
+    {
+        return Err("lm-detector detector, models and calibration do not match".to_owned());
+    }
+    if response_counts.len() < bank.models.len() {
+        return Err("response_counts shorter than models".to_owned());
+    }
     for (i, m) in bank.models.iter().enumerate() {
-        assert!(
-            (m.response_count as f64 - response_counts[i]).abs() < 1e-6,
-            "lm-detector models do not match the detector references"
-        );
+        if (m.response_count as f64 - response_counts[i]).abs() >= 1e-6 {
+            return Err("lm-detector models do not match the detector references".to_owned());
+        }
     }
 
     let ranker = &header["ranker"];
@@ -368,7 +699,7 @@ fn decode_detector(file: &[u8], models_json: &str) -> Detector {
     let lda_bias = resolve_vector(&ranker["lda_bias"], &floats);
     let references: Vec<Vec<Vec<f64>>> = ranker["references"]
         .as_array()
-        .expect("references")
+        .ok_or_else(|| "missing ranker.references".to_owned())?
         .iter()
         .map(|rows| resolve_matrix(rows, &floats))
         .collect();
@@ -381,17 +712,18 @@ fn decode_detector(file: &[u8], models_json: &str) -> Detector {
     let ordered = resolve_feature_bank(&ranker["bank"]["ordered_blocks"], &floats);
     let blend_frequency = ranker["blend"]["frequency"]
         .as_f64()
-        .expect("blend.frequency");
+        .ok_or_else(|| "missing blend.frequency".to_owned())?;
     let blend_positional = ranker["blend"]["positional"]
         .as_f64()
-        .expect("blend.positional");
+        .ok_or_else(|| "missing blend.positional".to_owned())?;
     let positional = &ranker["positional"];
     let positional_params = resolve_scalings(&positional["params"], &floats);
     let positional_weights = resolve_matrix(&positional["weights"], &floats);
     let positional_bias = resolve_vector(&positional["bias"], &floats);
 
-    Detector {
+    Ok(Detector {
         revision,
+        built_at: bank.built_at,
         tau,
         models: bank.models,
         head_params,
@@ -407,7 +739,7 @@ fn decode_detector(file: &[u8], models_json: &str) -> Detector {
         positional_params,
         positional_weights,
         positional_bias,
-    }
+    })
 }
 
 fn resolve_vector(value: &Value, floats: &[f64]) -> Vec<f64> {

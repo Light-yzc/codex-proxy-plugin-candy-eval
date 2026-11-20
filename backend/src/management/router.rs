@@ -12,7 +12,7 @@ use crate::coordinator::{
 };
 use crate::eval_runner::{CANDY_MAX_RUNS, PELICAN_VARIANTS};
 use crate::host_calls;
-use crate::lm_detector::detector_revision;
+use crate::lm_detector::{DetectorInfo, detector_info, detector_revision, force_sync_detector};
 use crate::state_store::{
     CandyEvalSettings, EvalMode, PelicanVariantKind, QueueState, load_queue, load_record_detail,
     load_records_index, load_settings, save_queue, save_settings,
@@ -45,6 +45,7 @@ async fn route(coordinator: &EvalCoordinator, call: TypedCall<ManagementRequest>
         ("POST", "api/step") => step_run(coordinator, call).await,
         ("POST", "api/stop") => stop_run(coordinator, call).await,
         ("POST", "api/records/delete") => delete_records(call).await,
+        ("POST", "api/detector/refresh") => refresh_detector(call).await,
         _ => Err(ApiError::new(404, "not_found", "未找到插件管理接口")),
     }
 }
@@ -63,6 +64,7 @@ struct AccountView {
 #[serde(rename_all = "camelCase")]
 struct StatusResponse {
     detector_revision: String,
+    detector_info: DetectorInfo,
     accounts: Vec<AccountView>,
     keys: Vec<gateway_plugin_sdk::call::host::ClientKey>,
     models: Vec<String>,
@@ -111,7 +113,8 @@ async fn status(coordinator: &EvalCoordinator, call: TypedCall<ManagementRequest
         .collect();
 
     json_reply(&StatusResponse {
-        detector_revision: detector_revision().to_owned(),
+        detector_revision: detector_revision(),
+        detector_info: detector_info(),
         accounts,
         keys,
         models,
@@ -159,6 +162,7 @@ struct SettingsPatchRequest {
     schedule_enabled: Option<bool>,
     schedule_time: Option<String>,
     timezone: Option<String>,
+    schedule_spread_minutes: Option<u32>,
     /// 兼容旧前端或调用方整对象回传 `updatedAtMs` 时不被拒绝
     #[serde(default, rename = "updatedAtMs")]
     _updated_at_ms: Option<i64>,
@@ -219,6 +223,7 @@ async fn start_run(coordinator: &EvalCoordinator, call: TypedCall<ManagementRequ
             schedule_enabled: None,
             schedule_time: None,
             timezone: None,
+            schedule_spread_minutes: None,
             _updated_at_ms: None,
         },
     )?;
@@ -264,6 +269,14 @@ async fn delete_records(call: TypedCall<ManagementRequest>) -> ApiResult {
     let req: DeleteRecordsRequest = decode_json(&call)?;
     let deleted = crate::state_store::delete_records(&call.host, req.ids.as_deref()).await?;
     json_reply(&json!({ "deleted": deleted }))
+}
+
+async fn refresh_detector(call: TypedCall<ManagementRequest>) -> ApiResult {
+    require_empty_json(&call)?;
+    match force_sync_detector().await {
+        Ok(info) => json_reply(&json!({ "updated": true, "detectorInfo": info })),
+        Err(err) => Err(ApiError::new(502, "detector_sync_failed", err)),
+    }
 }
 
 fn apply_settings_patch(
@@ -334,6 +347,12 @@ fn apply_settings_patch(
             return Err(ApiError::invalid("时区无效（如 Asia/Shanghai）"));
         }
         settings.timezone = tz;
+    }
+    if let Some(spread) = req.schedule_spread_minutes {
+        if spread > 360 {
+            return Err(ApiError::invalid("时间散布须在 0 到 360 分钟之间"));
+        }
+        settings.schedule_spread_minutes = spread;
     }
     Ok(())
 }

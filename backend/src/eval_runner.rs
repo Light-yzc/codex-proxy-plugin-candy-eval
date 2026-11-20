@@ -1,7 +1,7 @@
 //! 糖果题、模型指纹、画鹈鹕检测执行器（通过宿主 host.model.execute 执行）
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -15,15 +15,14 @@ use crate::codex_turn::build_codex_turn_body;
 use crate::host_calls::{self, CancelFlag, EvalUsage};
 use crate::lm_detector::{
     FINGERPRINT_TARGET, FingerprintAttribution, FingerprintOutputInput, analyze_fingerprint,
-    canonical_fingerprint_model_id, detector_revision, normalize_fingerprint_answer,
+    canonical_fingerprint_model_id, current_enrollment_suite_json, detector_revision,
+    normalize_fingerprint_answer,
 };
 use crate::state_store::{EvalMode, PelicanVariantKind, RecordHeader, TriggerKind, truncate_chars};
 
-const ENROLLMENT_SUITE_JSON: &str = include_str!("../data/lm-detector/enrollment-suite.json");
-
 pub const CANDY_MAX_RUNS: u32 = 10;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
-const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(90);
+const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(150);
 const MAX_ATTEMPTS: usize = 3;
 const PELICAN_MAX_CODE: usize = 192 * 1024;
 
@@ -81,35 +80,31 @@ struct FingerprintChallenge {
     expected_count: usize,
 }
 
-static ENROLLMENT_SUITE: OnceLock<Vec<FingerprintChallenge>> = OnceLock::new();
-
-fn enrollment_suite() -> &'static [FingerprintChallenge] {
-    ENROLLMENT_SUITE.get_or_init(|| {
-        #[derive(Deserialize)]
-        struct RawItem {
-            system: String,
-            user_prefix: String,
-            prompt: String,
-            expected_count: usize,
-        }
-        let items: Vec<RawItem> =
-            serde_json::from_str(ENROLLMENT_SUITE_JSON).expect("valid enrollment-suite.json");
-        items
-            .into_iter()
-            .map(|c| {
-                let prompt = if c.user_prefix.is_empty() {
-                    c.prompt
-                } else {
-                    format!("{}\n\nFinal task:\n{}", c.user_prefix, c.prompt)
-                };
-                FingerprintChallenge {
-                    instructions: c.system,
-                    prompt,
-                    expected_count: c.expected_count,
-                }
-            })
-            .collect()
-    })
+fn enrollment_suite() -> Vec<FingerprintChallenge> {
+    #[derive(Deserialize)]
+    struct RawItem {
+        system: String,
+        user_prefix: String,
+        prompt: String,
+        expected_count: usize,
+    }
+    let raw = current_enrollment_suite_json();
+    let items: Vec<RawItem> = serde_json::from_str(&raw).expect("valid enrollment-suite.json");
+    items
+        .into_iter()
+        .map(|c| {
+            let prompt = if c.user_prefix.is_empty() {
+                c.prompt
+            } else {
+                format!("{}\n\nFinal task:\n{}", c.user_prefix, c.prompt)
+            };
+            FingerprintChallenge {
+                instructions: c.system,
+                prompt,
+                expected_count: c.expected_count,
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]

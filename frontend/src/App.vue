@@ -4,6 +4,7 @@ import type {
   AccountView,
   CandyEvalSettings,
   ClientKeyView,
+  DetectorInfo,
   EvalMode,
   LiveEvalProgress,
   PelicanVariantId,
@@ -53,6 +54,7 @@ import {
   fetchRecordDetail,
   fetchRecords,
   fetchStatus,
+  refreshDetector,
   saveSettings,
   startRun,
   stepRun,
@@ -112,6 +114,8 @@ const clearing = ref(false)
 const errorMessage = ref('')
 
 const detectorRevision = ref('')
+const detectorInfo = ref<DetectorInfo | null>(null)
+const syncingDetector = ref(false)
 const accounts = ref<AccountView[]>([])
 const keys = ref<ClientKeyView[]>([])
 const models = ref<string[]>([])
@@ -136,6 +140,7 @@ const form = ref<CandyEvalSettings>({
   scheduleEnabled: false,
   scheduleTime: '08:00',
   timezone: 'Asia/Shanghai',
+  scheduleSpreadMinutes: 60,
   updatedAtMs: 0,
 })
 const formHydrated = ref(false)
@@ -260,6 +265,28 @@ const pelicanVariantOptions = computed(() =>
 const isRunning = computed(() => queue.value?.status === 'running')
 const isStopping = computed(() => queue.value?.status === 'stopping')
 const isBusy = computed(() => isRunning.value || isStopping.value)
+
+const spreadOptions = [
+  { label: '不散布 (0 分钟)', value: 0 },
+  { label: '15 分钟内', value: 15 },
+  { label: '30 分钟内', value: 30 },
+  { label: '1 小时内 (60 分钟)', value: 60 },
+  { label: '2 小时内 (120 分钟)', value: 120 },
+  { label: '3 小时内 (180 分钟)', value: 180 },
+  { label: '6 小时内 (360 分钟)', value: 360 },
+]
+
+const detectorBuiltDate = computed(() => {
+  const raw = detectorInfo.value?.builtAt || ''
+  return raw.length >= 10 ? raw.slice(0, 10) : ''
+})
+
+const nextRunLabel = computed(() => {
+  const ts = queue.value?.nextRunAtMs
+  if (!ts || ts <= Date.now())
+    return ''
+  return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false })
+})
 
 const shortDetectorRevision = computed(() => {
   const rev = detectorRevision.value
@@ -447,6 +474,7 @@ async function refreshAll(syncForm = false) {
   try {
     const [st, recRes] = await Promise.all([fetchStatus(), fetchRecords()])
     detectorRevision.value = st.detectorRevision
+    detectorInfo.value = st.detectorInfo ?? null
     accounts.value = st.accounts
     keys.value = st.keys
     models.value = st.models
@@ -561,6 +589,26 @@ function normalizeScheduleTime(raw: string): string {
   return match ? match[1] : (trimmed || '08:00')
 }
 
+async function handleRefreshDetector() {
+  syncingDetector.value = true
+  errorMessage.value = ''
+  try {
+    const res = await refreshDetector()
+    detectorInfo.value = res.detectorInfo
+    detectorRevision.value = res.detectorInfo.revision
+    notify.success({
+      title: '指纹库已更新',
+      message: `${res.detectorInfo.modelCount} 个模型（${res.detectorInfo.builtAt.slice(0, 10)}）`,
+    })
+  }
+  catch (err) {
+    showError('拉取最新模型指纹失败', err)
+  }
+  finally {
+    syncingDetector.value = false
+  }
+}
+
 async function handleSaveSettings() {
   saving.value = true
   errorMessage.value = ''
@@ -580,6 +628,7 @@ async function handleSaveSettings() {
       scheduleEnabled: form.value.scheduleEnabled,
       scheduleTime,
       timezone,
+      scheduleSpreadMinutes: form.value.scheduleSpreadMinutes ?? 0,
     })
     form.value = { ...res.settings }
     if (!models.value.includes(res.settings.model)) {
@@ -593,7 +642,7 @@ async function handleSaveSettings() {
     notify.success({
       title: '已保存配置',
       message: res.settings.scheduleEnabled
-        ? `每日定时检测已开启（${res.settings.scheduleTime} · ${res.settings.timezone}）`
+        ? `每日定时检测已开启（${res.settings.scheduleTime} · ${res.settings.timezone}${(res.settings.scheduleSpreadMinutes ?? 0) > 0 ? ` · ${res.settings.scheduleSpreadMinutes} 分钟内随机散布` : ''}）`
         : '已保存检测参数与勾选账号',
     })
     await refreshAll(false)
@@ -835,11 +884,22 @@ onUnmounted(() => {
           <span class="hidden items-center gap-1.5 text-xs text-z-text-tertiary sm:inline-flex">
             <span>归因库</span>
             <code class="rounded-z-sm bg-z-fill-quaternary px-1.5 py-0.5 font-mono text-[11px] text-z-text-secondary">
-              {{ shortDetectorRevision }}
+              {{ detectorInfo ? `${detectorInfo.modelCount} 模型 · ${detectorBuiltDate || shortDetectorRevision}` : shortDetectorRevision }}
             </code>
-            <span>·</span>
-            <span>复用宿主 Codex 指纹链路</span>
+            <ZTag v-if="detectorInfo" :type="detectorInfo.source === 'remote' ? 'success' : 'default'" size="small">
+              {{ detectorInfo.source === 'remote' ? '远端自动同步' : '内置' }}
+            </ZTag>
           </span>
+          <ZButton
+            size="small"
+            :loading="syncingDetector"
+            @click="handleRefreshDetector"
+          >
+            <template #icon>
+              <RefreshCw class="size-3.5" />
+            </template>
+            刷新指纹
+          </ZButton>
           <ZButton
             size="small"
             :loading="clearing"
@@ -1065,6 +1125,9 @@ onUnmounted(() => {
                 <span v-if="queue?.lastScheduledDate" class="ml-1 font-mono text-z-text-secondary">
                   上次计划日期：{{ queue.lastScheduledDate }}
                 </span>
+                <span v-if="isRunning && nextRunLabel" class="ml-2 font-mono text-z-primary">
+                  下次账号检测预计：{{ nextRunLabel }}（散布等待中）
+                </span>
               </p>
             </div>
           </div>
@@ -1084,6 +1147,15 @@ onUnmounted(() => {
                 class="h-z-control rounded-z border-0 bg-(--z-input-bg) px-3 text-z text-z-text shadow-z-input outline-none transition-[background-color,box-shadow] duration-160 hover:bg-(--z-input-hover-bg) focus:bg-(--z-input-active-bg) focus:shadow-z-input-active"
                 style="color-scheme: inherit"
               >
+            </div>
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-z-text-secondary">散布</span>
+              <ZSelect
+                v-model="form.scheduleSpreadMinutes"
+                :options="spreadOptions"
+                class="w-40"
+                aria-label="定时检测时间散布窗口"
+              />
             </div>
             <ZInput
               v-model="form.timezone"

@@ -80,6 +80,9 @@ impl EvalCoordinator {
         queue.pending_account_ids = account_ids;
         queue.started_at_ms = Some(now_ms);
         queue.updated_at_ms = now_ms;
+        queue.spread_minutes = 0;
+        queue.next_run_at_ms = None;
+        queue.window_end_at_ms = None;
         save_queue(host, version, &queue).await?;
         Ok(queue)
     }
@@ -99,6 +102,9 @@ impl EvalCoordinator {
             queue.stop_requested = true;
             queue.status = QueueStatus::Idle;
             queue.pending_account_ids.clear();
+            queue.spread_minutes = 0;
+            queue.next_run_at_ms = None;
+            queue.window_end_at_ms = None;
             queue.updated_at_ms = Utc::now().timestamp_millis();
             save_queue(host, version, &queue).await?;
         }
@@ -106,17 +112,24 @@ impl EvalCoordinator {
         Ok(queue)
     }
 
-    /// 供管理页驱动单步立即执行：若后台 maintenance 正在运行则返回 `busy: true`
+    /// 供管理页驱动步进：避免在 120s 限制的管理 RPC 内同步跑模型请求，交由后台 maintenance (600s) 排空队列
     pub async fn try_step_one(&self, host: &HostClient) -> Result<StepOutcome, PluginFault> {
-        let Ok(_guard) = self.run_lock.try_lock() else {
+        let (queue, _) = load_queue(host).await?;
+        let remaining = queue.pending_account_ids.len();
+        if queue.stop_requested || remaining == 0 {
             return Ok(StepOutcome {
-                busy: true,
+                busy: false,
                 processed: false,
                 remaining: 0,
-                finished: false,
+                finished: true,
             });
-        };
-        self.execute_next_account(host).await
+        }
+        Ok(StepOutcome {
+            busy: true,
+            processed: false,
+            remaining,
+            finished: false,
+        })
     }
 
     /// 宿主每 30 秒通过 `plugin.reconcile` 唤醒：负责检查每日定时计划，并在后台排空队列。
@@ -124,6 +137,15 @@ impl EvalCoordinator {
         let Ok(_guard) = self.run_lock.try_lock() else {
             return Ok(());
         };
+        if let Err(err) = crate::lm_detector::maybe_auto_sync().await {
+            host_calls::log_event(
+                host,
+                LogLevel::Warn,
+                "candy_eval.detector_sync_failed",
+                BTreeMap::from([("error".to_owned(), json!(err))]),
+            )
+            .await;
+        }
         let (settings, _) = load_settings(host).await?;
         let (mut queue, mut queue_version) = load_queue(host).await?;
 
@@ -159,6 +181,23 @@ impl EvalCoordinator {
                 queue.total = target_ids.len() as u32;
                 queue.completed = 0;
                 queue.pending_account_ids = target_ids;
+                let spread_minutes = settings.schedule_spread_minutes.min(360);
+                queue.spread_minutes = spread_minutes;
+                if spread_minutes > 0 {
+                    let window_ms = i64::from(spread_minutes) * 60_000;
+                    let count = i64::from(queue.total.max(1));
+                    let max_initial = if count <= 1 {
+                        window_ms
+                    } else {
+                        ((window_ms / count) * 7 / 10).max(1)
+                    };
+                    let initial_delay = random_millis(0, max_initial);
+                    queue.window_end_at_ms = Some(now_ms + window_ms);
+                    queue.next_run_at_ms = Some(now_ms + initial_delay);
+                } else {
+                    queue.window_end_at_ms = None;
+                    queue.next_run_at_ms = None;
+                }
                 queue.started_at_ms = Some(now_ms);
                 queue.updated_at_ms = now_ms;
                 queue.last_scheduled_date = today.clone();
@@ -171,6 +210,7 @@ impl EvalCoordinator {
                         ("date".to_owned(), json!(today)),
                         ("accounts".to_owned(), json!(queue.total)),
                         ("mode".to_owned(), json!(queue.mode.as_str())),
+                        ("spread_minutes".to_owned(), json!(spread_minutes)),
                     ]),
                 )
                 .await;
@@ -178,15 +218,50 @@ impl EvalCoordinator {
         }
         let _ = queue_version;
 
-        // 给每轮 reconcile 留足预算余量（至少剩余 90s 才开下一账号），避免超时中断
+        // 给每轮 reconcile 留足预算余量（至少剩余 150s 才开下一账号），避免超时中断
         loop {
+            let (cur_queue, _) = load_queue(host).await?;
+            if cur_queue.status != QueueStatus::Running
+                || cur_queue.stop_requested
+                || cur_queue.pending_account_ids.is_empty()
+            {
+                break;
+            }
+            let now_ms = Utc::now().timestamp_millis();
+            if let Some(next_at) = cur_queue.next_run_at_ms
+                && now_ms < next_at
+            {
+                break;
+            }
             let remaining_budget = deadline.saturating_duration_since(Instant::now());
-            if remaining_budget < Duration::from_secs(90) {
+            if remaining_budget < Duration::from_secs(150) {
                 break;
             }
             let outcome = self.execute_next_account(host).await?;
             if !outcome.processed || outcome.finished {
                 break;
+            }
+            let (mut after_queue, after_ver) = load_queue(host).await?;
+            if after_queue.spread_minutes > 0 && !after_queue.pending_account_ids.is_empty() {
+                let done_ms = Utc::now().timestamp_millis();
+                let window_end = after_queue.window_end_at_ms.unwrap_or(done_ms);
+                let rem_window = window_end.saturating_sub(done_ms);
+                if rem_window > 30_000 {
+                    let rem_accounts = after_queue.pending_account_ids.len() as i64;
+                    let avg_gap = (rem_window / rem_accounts.max(1)).max(30_000);
+                    let low = (avg_gap * 65 / 100).max(30_000);
+                    let high = (avg_gap * 115 / 100).min(rem_window).max(low);
+                    let gap_ms = random_millis(low, high);
+                    after_queue.next_run_at_ms = Some(done_ms + gap_ms);
+                    after_queue.updated_at_ms = done_ms;
+                    let _ = save_queue(host, after_ver, &after_queue).await;
+                    break;
+                }
+                if after_queue.next_run_at_ms.is_some() {
+                    after_queue.next_run_at_ms = None;
+                    after_queue.updated_at_ms = done_ms;
+                    let _ = save_queue(host, after_ver, &after_queue).await;
+                }
             }
         }
         Ok(())
@@ -433,4 +508,13 @@ pub fn should_trigger_today(settings: &CandyEvalSettings, last_date: &str) -> Op
     } else {
         None
     }
+}
+
+fn random_millis(min_ms: i64, max_ms: i64) -> i64 {
+    if max_ms <= min_ms {
+        return min_ms.max(0);
+    }
+    let span = (max_ms - min_ms) as u128 + 1;
+    let offset = (Uuid::new_v4().as_u128() % span) as i64;
+    min_ms + offset
 }
