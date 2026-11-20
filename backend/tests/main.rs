@@ -11,7 +11,8 @@ use codex_proxy_plugin_candy_eval::lm_detector::{
     FingerprintOutputInput, analyze_fingerprint, canonical_fingerprint_model_id,
 };
 use codex_proxy_plugin_candy_eval::state_store::{
-    CandyEvalSettings, QueueState, RecordDetail, RecordsIndex,
+    CandyEvalSettings, QueueState, RecordDetail, RecordsIndex, queue_state_value,
+    settings_state_value,
 };
 use codex_proxy_plugin_candy_eval::{manifest, plugin};
 use gateway_plugin_sdk::call::data::AccountFacts;
@@ -34,13 +35,13 @@ fn manifest_and_plugin_builder_validate() {
         })
         .collect();
 
-    let settings_val = serde_json::to_value(CandyEvalSettings::default()).unwrap();
+    let settings_val = settings_state_value(&CandyEvalSettings::default());
     assert!(
         validators["candy_eval_settings"].is_valid(&settings_val),
         "default settings must satisfy schema"
     );
 
-    let queue_val = serde_json::to_value(QueueState::default()).unwrap();
+    let queue_val = queue_state_value(&QueueState::default());
     assert!(
         validators["candy_eval_queue"].is_valid(&queue_val),
         "default queue must satisfy schema"

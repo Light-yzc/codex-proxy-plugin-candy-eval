@@ -234,6 +234,26 @@ fn save_schedule_ext(ext: &ScheduleExt) {
     let _ = ext;
 }
 
+#[must_use]
+pub fn settings_state_value(settings: &CandyEvalSettings) -> Value {
+    let mut val = serde_json::to_value(settings).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.remove("scheduleSpreadMinutes");
+    }
+    val
+}
+
+#[must_use]
+pub fn queue_state_value(queue: &QueueState) -> Value {
+    let mut val = serde_json::to_value(queue).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.remove("spreadMinutes");
+        obj.remove("nextRunAtMs");
+        obj.remove("windowEndAtMs");
+    }
+    val
+}
+
 pub async fn load_settings(
     host: &HostClient,
 ) -> Result<(CandyEvalSettings, Option<u64>), PluginFault> {
@@ -253,10 +273,7 @@ pub async fn save_settings(
     ext.schedule_spread_minutes = settings.schedule_spread_minutes.min(360);
     save_schedule_ext(&ext);
 
-    let mut val = serde_json::to_value(settings).unwrap_or_else(|_| json!({}));
-    if let Some(obj) = val.as_object_mut() {
-        obj.remove("scheduleSpreadMinutes");
-    }
+    let val = settings_state_value(settings);
     put_typed(
         host,
         STATE_NS_SETTINGS,
@@ -288,12 +305,7 @@ pub async fn save_queue(
     ext.window_end_at_ms = queue.window_end_at_ms;
     save_schedule_ext(&ext);
 
-    let mut val = serde_json::to_value(queue).unwrap_or_else(|_| json!({}));
-    if let Some(obj) = val.as_object_mut() {
-        obj.remove("spreadMinutes");
-        obj.remove("nextRunAtMs");
-        obj.remove("windowEndAtMs");
-    }
+    let val = queue_state_value(queue);
     put_typed(host, STATE_NS_QUEUE, KEY_QUEUE, expected_version, &val).await
 }
 
