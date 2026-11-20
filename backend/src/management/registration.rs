@@ -28,6 +28,7 @@ pub fn registration() -> ManagementRegistration {
             post("api/step"),
             post("api/stop"),
             post("api/records/delete"),
+            post("api/detector/refresh"),
         ],
         resources: ["web/index.html", "web/app.js", "web/app.css"]
             .into_iter()
