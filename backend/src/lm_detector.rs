@@ -148,7 +148,7 @@ struct DetectorRuntime {
 static RUNTIME_STATE: OnceLock<RwLock<DetectorRuntime>> = OnceLock::new();
 static SYNC_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
-fn cache_dir() -> PathBuf {
+pub(crate) fn cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CANDY_EVAL_CACHE_DIR")
         && !dir.trim().is_empty()
     {

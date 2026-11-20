@@ -184,10 +184,64 @@ pub struct RecordDetail {
     pub detail: Value,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScheduleExt {
+    #[serde(default)]
+    schedule_spread_minutes: u32,
+    #[serde(default)]
+    spread_minutes: u32,
+    #[serde(default)]
+    next_run_at_ms: Option<i64>,
+    #[serde(default)]
+    window_end_at_ms: Option<i64>,
+}
+
+#[cfg(not(test))]
+fn schedule_ext_path() -> std::path::PathBuf {
+    crate::lm_detector::cache_dir().join("schedule_ext.json")
+}
+
+fn load_schedule_ext() -> ScheduleExt {
+    #[cfg(test)]
+    {
+        ScheduleExt::default()
+    }
+    #[cfg(not(test))]
+    {
+        std::fs::read_to_string(schedule_ext_path())
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+}
+
+fn save_schedule_ext(ext: &ScheduleExt) {
+    #[cfg(not(test))]
+    {
+        let path = schedule_ext_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(ext) {
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, &bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+    #[cfg(test)]
+    let _ = ext;
+}
+
 pub async fn load_settings(
     host: &HostClient,
 ) -> Result<(CandyEvalSettings, Option<u64>), PluginFault> {
-    load_or_default(host, STATE_NS_SETTINGS, KEY_SETTINGS).await
+    let (mut settings, version): (CandyEvalSettings, Option<u64>) =
+        load_or_default(host, STATE_NS_SETTINGS, KEY_SETTINGS).await?;
+    let ext = load_schedule_ext();
+    settings.schedule_spread_minutes = ext.schedule_spread_minutes.min(360);
+    Ok((settings, version))
 }
 
 pub async fn save_settings(
@@ -195,18 +249,32 @@ pub async fn save_settings(
     expected_version: Option<u64>,
     settings: &CandyEvalSettings,
 ) -> Result<u64, PluginFault> {
+    let mut ext = load_schedule_ext();
+    ext.schedule_spread_minutes = settings.schedule_spread_minutes.min(360);
+    save_schedule_ext(&ext);
+
+    let mut val = serde_json::to_value(settings).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.remove("scheduleSpreadMinutes");
+    }
     put_typed(
         host,
         STATE_NS_SETTINGS,
         KEY_SETTINGS,
         expected_version,
-        settings,
+        &val,
     )
     .await
 }
 
 pub async fn load_queue(host: &HostClient) -> Result<(QueueState, Option<u64>), PluginFault> {
-    load_or_default(host, STATE_NS_QUEUE, KEY_QUEUE).await
+    let (mut queue, version): (QueueState, Option<u64>) =
+        load_or_default(host, STATE_NS_QUEUE, KEY_QUEUE).await?;
+    let ext = load_schedule_ext();
+    queue.spread_minutes = ext.spread_minutes.min(360);
+    queue.next_run_at_ms = ext.next_run_at_ms;
+    queue.window_end_at_ms = ext.window_end_at_ms;
+    Ok((queue, version))
 }
 
 pub async fn save_queue(
@@ -214,7 +282,19 @@ pub async fn save_queue(
     expected_version: Option<u64>,
     queue: &QueueState,
 ) -> Result<u64, PluginFault> {
-    put_typed(host, STATE_NS_QUEUE, KEY_QUEUE, expected_version, queue).await
+    let mut ext = load_schedule_ext();
+    ext.spread_minutes = queue.spread_minutes.min(360);
+    ext.next_run_at_ms = queue.next_run_at_ms;
+    ext.window_end_at_ms = queue.window_end_at_ms;
+    save_schedule_ext(&ext);
+
+    let mut val = serde_json::to_value(queue).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = val.as_object_mut() {
+        obj.remove("spreadMinutes");
+        obj.remove("nextRunAtMs");
+        obj.remove("windowEndAtMs");
+    }
+    put_typed(host, STATE_NS_QUEUE, KEY_QUEUE, expected_version, &val).await
 }
 
 pub async fn load_records_index(
