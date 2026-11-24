@@ -388,8 +388,19 @@ impl EvalCoordinator {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 
-        if let Some(record) = completed_record {
-            append_record(host, record.header, record.detail).await?;
+        if let Some(record) = completed_record
+            && let Err(err) = append_record(host, record.header, record.detail).await
+        {
+            host_calls::log_event(
+                host,
+                LogLevel::Warn,
+                "candy_eval.append_record_failed",
+                BTreeMap::from([
+                    ("account_id".to_owned(), json!(account_id)),
+                    ("error".to_owned(), json!(err.message)),
+                ]),
+            )
+            .await;
         }
 
         // 重新读取队列，保留在执行期间可能通过 POST /api/stop 提交的状态变更

@@ -10,7 +10,7 @@ use crate::manifest::{STATE_NS_DETAIL, STATE_NS_QUEUE, STATE_NS_RECORDS, STATE_N
 const KEY_SETTINGS: &str = "default";
 const KEY_QUEUE: &str = "state";
 const KEY_RECORDS: &str = "index";
-const MAX_RECORDS_KEEP: usize = 120;
+const MAX_RECORDS_KEEP: usize = 115;
 const MAX_DETAIL_JSON_BYTES: usize = 230 * 1024;
 const MAX_INDEX_JSON_BYTES: usize = 230 * 1024;
 
@@ -337,17 +337,8 @@ pub async fn append_record(
         id: header.id.clone(),
         detail: fitted_detail,
     };
-    let existing_detail = host_calls::get_state(host, STATE_NS_DETAIL, &header.id).await?;
-    let detail_version = existing_detail.record.map(|r| r.version);
-    put_typed(
-        host,
-        STATE_NS_DETAIL,
-        &header.id,
-        detail_version,
-        &detail_record,
-    )
-    .await?;
 
+    // 先加载索引并淘汰旧详情，确保 candy_eval_detail 写入前不触碰 maximumRecords=120 上限
     let (mut index, version) = load_records_index(host).await?;
     index.records.insert(0, header);
     let mut removed_ids = Vec::new();
@@ -359,11 +350,22 @@ pub async fn append_record(
         };
         removed_ids.push(removed.id);
     }
-    put_typed(host, STATE_NS_RECORDS, KEY_RECORDS, version, &index).await?;
-
-    for id in removed_ids {
-        delete_detail_best_effort(host, &id).await;
+    for id in &removed_ids {
+        delete_detail_best_effort(host, id).await;
     }
+
+    let existing_detail = host_calls::get_state(host, STATE_NS_DETAIL, &detail_record.id).await?;
+    let detail_version = existing_detail.record.map(|r| r.version);
+    put_typed(
+        host,
+        STATE_NS_DETAIL,
+        &detail_record.id,
+        detail_version,
+        &detail_record,
+    )
+    .await?;
+
+    put_typed(host, STATE_NS_RECORDS, KEY_RECORDS, version, &index).await?;
     Ok(())
 }
 
